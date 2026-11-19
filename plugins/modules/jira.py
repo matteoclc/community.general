@@ -103,7 +103,7 @@ options:
     description:
       - Used to specify comment comment visibility.
       - See
-        U(https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-issue-comments/#api-rest-api-2-issue-issueidorkey-comment-post)
+        U(https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/#api-rest-api-3-issue-issueidorkey-comment-post)
         for details.
     suboptions:
       type:
@@ -200,9 +200,15 @@ options:
   cloud:
     description:
       - Enable when using Jira Cloud.
-      - When set to V(true), the module uses Jira Cloud compatible behavior.
-      - When set to V(false) (the default), the module uses Jira Server / Data Center compatible behavior.
-      - In the future, this option might affect additional operations for Jira Cloud compatibility.
+      - When set to V(true), the module uses the Jira Cloud REST API v3 (C(/rest/api/3)) and Jira Cloud compatible
+        behavior. Rich-text values (O(description), O(comment), and comment bodies on O(operation=worklog) and
+        O(operation=transition)) are sent as Atlassian Document Format (ADF) documents converted from the plain string,
+        and O(operation=search) uses the C(/rest/api/3/search/jql) endpoint. Added in community.general 14.1.0.
+        Rich-text fields inside O(fields) (for example textarea custom fields) must be passed as ADF documents already
+        when using Jira Cloud. Values of rich-text fields in the results of O(operation=fetch) and O(operation=search)
+        are ADF documents when using Jira Cloud.
+      - When set to V(false) (the default), the module uses the REST API v2 (C(/rest/api/2)) and Jira Server /
+        Data Center compatible behavior.
     type: bool
     default: false
     version_added: '12.6.0'
@@ -243,8 +249,11 @@ options:
 notes:
   - Currently this only works with basic-auth, or tokens.
   - To use with JIRA Cloud, pass the login e-mail as the O(username) and the API token as O(password).
-  - Jira Cloud has removed the legacy C(/rest/api/2/search) endpoint. Set O(cloud=true) when using
-    O(operation=search) against Jira Cloud so that the module uses the replacement C(/rest/api/2/search/jql) endpoint instead.
+  - When O(cloud=true), the module uses the Jira Cloud REST API v3 (C(/rest/api/3)) instead of C(/rest/api/2).
+    In particular, O(operation=search) uses the C(/rest/api/3/search/jql) endpoint, and rich-text values
+    (O(description), O(comment)) are sent as Atlassian Document Format (ADF) documents converted from the plain
+    string instead of plain text. Jira Cloud no longer interprets wiki markup in these values; the markup is shown
+    literally. Added in community.general 14.1.0.
 author:
   - "Steve Smith (@tarka)"
   - "Per Abildgaard Toft (@pertoft)"
@@ -458,7 +467,7 @@ EXAMPLES = r"""
       lastViewed:
   register: issue
 
-# Search for an issue on Jira Cloud (uses the /search/jql endpoint)
+# Search for an issue on Jira Cloud (uses the /rest/api/3/search/jql endpoint)
 - name: Search for an issue on Jira Cloud
   community.general.jira:
     uri: '{{ server }}'
@@ -666,7 +675,8 @@ class JIRA(StateModuleHelper):
 
     def __init_module__(self):
         self.vars.uri = self.vars.uri.strip("/")
-        self.vars.set("restbase", f"{self.vars.uri}/rest/api/2")
+        api_version = 3 if self.vars.cloud else 2
+        self.vars.set("restbase", f"{self.vars.uri}/rest/api/{api_version}")
         if self.vars.fields is None:
             self.vars.fields = {}
         if self.vars.assignee:
@@ -716,6 +726,32 @@ class JIRA(StateModuleHelper):
             )
         return user["accountId"]
 
+    @staticmethod
+    def to_adf(text):
+        """Convert a plain string to an Atlassian Document Format (ADF) document.
+
+        Jira Cloud REST API v3 requires rich-text fields (description, comment bodies)
+        in ADF instead of plain text. Paragraphs are separated by blank lines, single
+        line breaks become hard breaks.
+        """
+        paragraphs = []
+        for paragraph_text in text.split("\n\n"):
+            content = []
+            lines = paragraph_text.split("\n")
+            for index, line in enumerate(lines):
+                if index > 0:
+                    content.append({"type": "hardBreak"})
+                if line:
+                    content.append({"type": "text", "text": line})
+            paragraphs.append({"type": "paragraph", "content": content})
+        return {"type": "doc", "version": 1, "content": paragraphs}
+
+    def rich_text(self, value):
+        """Return the value for a rich-text field, converted to ADF on Jira Cloud."""
+        if self.vars.cloud and isinstance(value, str):
+            return self.to_adf(value)
+        return value
+
     @cause_changes(when="success")
     def operation_create(self):
         createfields = {
@@ -725,11 +761,16 @@ class JIRA(StateModuleHelper):
         }
 
         if self.vars.description:
-            createfields["description"] = self.vars.description
+            createfields["description"] = self.rich_text(self.vars.description)
 
         # Merge in any additional or overridden fields
         if self.vars.fields:
             createfields.update(self.vars.fields)
+
+        if self.vars.cloud:
+            description = createfields.get("description")
+            if isinstance(description, str):
+                createfields["description"] = self.to_adf(description)
 
         data = {"fields": createfields}
         url = f"{self.vars.restbase}/issue/"
@@ -737,7 +778,7 @@ class JIRA(StateModuleHelper):
 
     @cause_changes(when="success")
     def operation_comment(self):
-        data = {"body": self.vars.comment}
+        data = {"body": self.rich_text(self.vars.comment)}
         # if comment_visibility is specified restrict visibility
         if self.vars.comment_visibility is not None:
             data["visibility"] = self.vars.comment_visibility
@@ -751,7 +792,7 @@ class JIRA(StateModuleHelper):
 
     @cause_changes(when="success")
     def operation_worklog(self):
-        data = {"comment": self.vars.comment}
+        data = {"comment": self.rich_text(self.vars.comment)}
         # if comment_visibility is specified restrict visibility
         if self.vars.comment_visibility is not None:
             data["visibility"] = self.vars.comment_visibility
@@ -830,7 +871,11 @@ class JIRA(StateModuleHelper):
         if self.vars.summary is not None:
             fields.update({"summary": self.vars.summary})
         if self.vars.description is not None:
-            fields.update({"description": self.vars.description})
+            fields.update({"description": self.rich_text(self.vars.description)})
+        if self.vars.cloud:
+            description = fields.get("description")
+            if isinstance(description, str):
+                fields["description"] = self.to_adf(description)
 
         # Perform it
         data = {"transition": {"id": tid}, "fields": fields}
@@ -838,7 +883,7 @@ class JIRA(StateModuleHelper):
             data.update(
                 {
                     "update": {
-                        "comment": [{"add": {"body": self.vars.comment}}],
+                        "comment": [{"add": {"body": self.rich_text(self.vars.comment)}}],
                     }
                 }
             )
